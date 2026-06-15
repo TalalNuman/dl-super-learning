@@ -71,8 +71,54 @@ class SimCLRModel(nn.Module):
         return self.encoder(x)
 
 
-# ── Main: print model summary ──────────────────────────────────────────────
+# ── Similarity Matrix and Loss Functions ────────────────────────────────────
+def compute_similarity_matrix(z: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the cosine similarity matrix of shape (2N, 2N) for batch z (2N, D).
+    Each row of z is L2-normalized first.
+    """
+    z_normalized = torch.nn.functional.normalize(z, p=2, dim=1)
+    sim_matrix = torch.matmul(z_normalized, z_normalized.T)
+    return sim_matrix
+
+
+def nt_xent_loss(z: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
+    """
+    Computes the NT-Xent loss for batch z of shape (2N, D).
+    The first N rows are view1, and the next N rows are view2.
+    """
+    two_n = z.shape[0]
+    n = two_n // 2
+    
+    # Cosine similarity matrix scaled by temperature
+    sim_matrix = compute_similarity_matrix(z) / temperature
+    
+    # Mask to remove self-similarity (diagonal)
+    mask = ~torch.eye(two_n, dtype=torch.bool, device=z.device)
+    
+    # Filter out diagonal and reshape to (2N, 2N - 1)
+    logits = sim_matrix[mask].view(two_n, two_n - 1)
+    
+    # Target positive pairs index map:
+    # For sample i (0 <= i < N), the positive is sample i + N.
+    # Since we remove the diagonal (self-similarity at i), the index shifts:
+    # - If i < N, positive index is i + N. Since i + N > i, shifts left by 1 to: i + N - 1.
+    # - If i >= N, positive index is i - N. Since i - N < i, does not shift: i - N.
+    targets = torch.arange(two_n, device=z.device)
+    targets = torch.where(targets < n, targets + n - 1, targets - n)
+    
+    loss = torch.nn.functional.cross_entropy(logits, targets)
+    return loss
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from torchvision import datasets
+    from MSDS25011_05_task2_augmentations import TwoViewTransform, simclr_transform
+
     model = SimCLRModel()
 
     # ── Encoder summary ────────────────────────────────────────────────
@@ -104,3 +150,64 @@ if __name__ == '__main__':
     print(f'  forward()       → z.shape = {tuple(z.shape)}   (projection)')
     print(f'  get_features()  → h.shape = {tuple(h.shape)}  (encoder)')
     print('=' * 65)
+
+    # ── Loss and Heatmap Verification ──────────────────────────────────
+    print('\nGenerating Similarity Matrix Heatmap (Before Training)...')
+    os.makedirs('results', exist_ok=True)
+
+    # Load 4 images and apply TwoViewTransform
+    two_view_tf = TwoViewTransform(simclr_transform)
+    cifar_two_view = datasets.CIFAR10(
+        root='./data', train=True, download=True, transform=two_view_tf
+    )
+    
+    # Collate 4 samples (each is ((view1, view2), label))
+    v1_list, v2_list = [], []
+    for i in range(4):
+        (v1, v2), _ = cifar_two_view[i]
+        v1_list.append(v1)
+        v2_list.append(v2)
+        
+    # Stack views so the first N are view1, next N are view2
+    batch = torch.stack(v1_list + v2_list, dim=0) # shape (8, 3, 32, 32)
+    
+    # Pass through random model
+    model.eval()
+    with torch.no_grad():
+        z_batch = model(batch)
+        sim_matrix = compute_similarity_matrix(z_batch).cpu().numpy()
+        loss_val = nt_xent_loss(z_batch, temperature=0.5).item()
+        
+    print(f'NT-Xent Loss on this batch: {loss_val:.4f}')
+
+    # Plot Similarity Matrix Heatmap
+    labels = [
+        'Img1_V1', 'Img2_V1', 'Img3_V1', 'Img4_V1',
+        'Img1_V2', 'Img2_V2', 'Img3_V2', 'Img4_V2'
+    ]
+    
+    fig, ax = plt.subplots(figsize=(8, 6.5))
+    im = ax.imshow(sim_matrix, cmap='coolwarm', vmin=-1.0, vmax=1.0)
+    
+    # Add colorbar
+    cbar = ax.figure.colorbar(im, ax=ax)
+    cbar.ax.set_ylabel("Cosine Similarity", rotation=-90, va="bottom")
+    
+    # Show all ticks and label them with the respective list entries
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticklabels(labels)
+    
+    # Loop over data dimensions and create text annotations
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            ax.text(j, i, f"{sim_matrix[i, j]:.2f}",
+                    ha="center", va="center", color="black" if abs(sim_matrix[i, j]) < 0.7 else "white")
+            
+    ax.set_title("Cosine Similarity Matrix Before Training\n(Untrained ResNet-18 + MLP projection head)", fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('results/similarity_matrix_before_training.png', dpi=150)
+    plt.close()
+    print('Pre-training similarity heatmap saved → results/similarity_matrix_before_training.png')
+
