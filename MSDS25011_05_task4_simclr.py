@@ -111,81 +111,71 @@ def nt_xent_loss(z: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
     return loss
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from torchvision import datasets
-    from MSDS25011_05_task2_augmentations import TwoViewTransform, simclr_transform
-
-    model = SimCLRModel()
-
-    # ── Encoder summary ────────────────────────────────────────────────
-    print('=' * 65)
-    print('SimCLR Model Summary')
-    print('=' * 65)
-
-    print('\n── Encoder (CIFAR-10 ResNet-18) ──')
-    print(model.encoder)
-
-    print('\n── Projection Head ──')
-    print(model.projector)
-
-    # ── Parameter counts ───────────────────────────────────────────────
-    encoder_params   = sum(p.numel() for p in model.encoder.parameters())
-    projector_params = sum(p.numel() for p in model.projector.parameters())
-    total_params     = sum(p.numel() for p in model.parameters())
-
-    print('\n── Parameter Counts ──')
-    print(f'  Encoder    : {encoder_params:>10,}')
-    print(f'  Projector  : {projector_params:>10,}')
-    print(f'  Total      : {total_params:>10,}')
-
-    # ── Quick shape check ──────────────────────────────────────────────
-    dummy = torch.randn(2, 3, 32, 32)
-    z = model(dummy)
-    h = model.get_features(dummy)
-    print(f'\n── Shape Check (batch=2, 3×32×32 input) ──')
-    print(f'  forward()       → z.shape = {tuple(z.shape)}   (projection)')
-    print(f'  get_features()  → h.shape = {tuple(h.shape)}  (encoder)')
-    print('=' * 65)
-
-    # ── Loss and Heatmap Verification ──────────────────────────────────
-    print('\nGenerating Similarity Matrix Heatmap (Before Training)...')
-    os.makedirs('results', exist_ok=True)
-
-    # Load 4 images and apply TwoViewTransform
-    two_view_tf = TwoViewTransform(simclr_transform)
-    cifar_two_view = datasets.CIFAR10(
-        root='./data', train=True, download=True, transform=two_view_tf
-    )
-    
-    # Collate 4 samples (each is ((view1, view2), label))
-    v1_list, v2_list = [], []
-    for i in range(4):
-        (v1, v2), _ = cifar_two_view[i]
-        v1_list.append(v1)
-        v2_list.append(v2)
-        
-    # Stack views so the first N are view1, next N are view2
-    batch = torch.stack(v1_list + v2_list, dim=0) # shape (8, 3, 32, 32)
-    
-    # Pass through random model
+@torch.no_grad()
+def compute_avg_similarities(model: nn.Module, dataloader: torch.utils.data.DataLoader, device: torch.device):
+    """
+    Computes average cosine similarity for same-image views and different-image views
+    using the model's encoder features (get_features).
+    """
     model.eval()
-    with torch.no_grad():
-        z_batch = model(batch)
-        sim_matrix = compute_similarity_matrix(z_batch).cpu().numpy()
-        loss_val = nt_xent_loss(z_batch, temperature=0.5).item()
+    total_same_sim = 0.0
+    total_diff_sim = 0.0
+    total_same_count = 0
+    total_diff_count = 0
+    
+    for (x_i, x_j), _ in dataloader:
+        x_i, x_j = x_i.to(device), x_j.to(device)
         
-    print(f'NT-Xent Loss on this batch: {loss_val:.4f}')
+        # Get 512-dim features
+        h_i = model.get_features(x_i)
+        h_j = model.get_features(x_j)
+        
+        h_i_norm = torch.nn.functional.normalize(h_i, p=2, dim=1)
+        h_j_norm = torch.nn.functional.normalize(h_j, p=2, dim=1)
+        
+        # Compute cosine similarity matrix between view1 and view2
+        sim_matrix = torch.matmul(h_i_norm, h_j_norm.T)
+        
+        # Same-image similarity (diagonal of sim_matrix)
+        same_sims = torch.diag(sim_matrix)
+        total_same_sim += same_sims.sum().item()
+        total_same_count += same_sims.numel()
+        
+        # Different-image similarity (off-diagonal elements of sim_matrix)
+        n = sim_matrix.shape[0]
+        if n > 1:
+            mask = ~torch.eye(n, dtype=torch.bool, device=device)
+            diff_sims = sim_matrix[mask]
+            total_diff_sim += diff_sims.sum().item()
+            total_diff_count += diff_sims.numel()
+            
+    avg_same = total_same_sim / total_same_count if total_same_count > 0 else 0.0
+    avg_diff = total_diff_sim / total_diff_count if total_diff_count > 0 else 0.0
+    return avg_same, avg_diff
 
-    # Plot Similarity Matrix Heatmap
+
+def load_split(split_file: str, transform, cifar_root: str = './data') -> torch.utils.data.Subset:
+    """
+    Load a CIFAR-10 subset defined by an index file with a custom transform.
+    """
+    is_train = 'test' not in os.path.basename(split_file)
+    full_dataset = datasets.CIFAR10(
+        root=cifar_root,
+        train=is_train,
+        download=True,
+        transform=transform,
+    )
+    with open(split_file, 'r') as f:
+        indices = [int(line.strip()) for line in f if line.strip()]
+    return torch.utils.data.Subset(full_dataset, indices)
+
+
+def save_similarity_heatmap(sim_matrix: np.ndarray, filename: str, title: str):
+    """Saves an 8x8 similarity matrix heatmap."""
     labels = [
         'Img1_V1', 'Img2_V1', 'Img3_V1', 'Img4_V1',
         'Img1_V2', 'Img2_V2', 'Img3_V2', 'Img4_V2'
     ]
-    
     fig, ax = plt.subplots(figsize=(8, 6.5))
     im = ax.imshow(sim_matrix, cmap='coolwarm', vmin=-1.0, vmax=1.0)
     
@@ -193,21 +183,156 @@ if __name__ == '__main__':
     cbar = ax.figure.colorbar(im, ax=ax)
     cbar.ax.set_ylabel("Cosine Similarity", rotation=-90, va="bottom")
     
-    # Show all ticks and label them with the respective list entries
+    # Label axes
     ax.set_xticks(np.arange(len(labels)))
     ax.set_yticks(np.arange(len(labels)))
     ax.set_xticklabels(labels, rotation=45, ha="right")
     ax.set_yticklabels(labels)
     
-    # Loop over data dimensions and create text annotations
+    # Annotate values
     for i in range(len(labels)):
         for j in range(len(labels)):
             ax.text(j, i, f"{sim_matrix[i, j]:.2f}",
                     ha="center", va="center", color="black" if abs(sim_matrix[i, j]) < 0.7 else "white")
             
-    ax.set_title("Cosine Similarity Matrix Before Training\n(Untrained ResNet-18 + MLP projection head)", fontsize=12, fontweight='bold')
+    ax.set_title(title, fontsize=11, fontweight='bold')
     plt.tight_layout()
-    plt.savefig('results/similarity_matrix_before_training.png', dpi=150)
+    plt.savefig(filename, dpi=150)
     plt.close()
-    print('Pre-training similarity heatmap saved → results/similarity_matrix_before_training.png')
+
+
+def visualize_4_samples(model: nn.Module, dataset: torch.utils.data.Subset, device: torch.device, filename: str, title: str):
+    """Extracts 4 samples, processes through the model, and plots heatmap."""
+    v1_list, v2_list = [], []
+    for i in range(4):
+        (v1, v2), _ = dataset[i]
+        v1_list.append(v1)
+        v2_list.append(v2)
+        
+    batch = torch.stack(v1_list + v2_list, dim=0).to(device) # shape (8, 3, 32, 32)
+    model.eval()
+    with torch.no_grad():
+        z_batch = model(batch)
+        sim_matrix = compute_similarity_matrix(z_batch).cpu().numpy()
+        
+    save_similarity_heatmap(sim_matrix, filename, title)
+
+
+# ── Main Pretraining Script ──────────────────────────────────────────────────
+if __name__ == '__main__':
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from torchvision import datasets
+    from MSDS25011_05_task2_augmentations import TwoViewTransform, simclr_transform
+
+    # Output directories
+    for d in ('graphs', 'results', 'models'):
+        os.makedirs(d, exist_ok=True)
+
+    # ── Device selection ────────────────────────────────────────────────
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+    print(f'Using device: {device}\n')
+
+    # ── Hyperparameters ─────────────────────────────────────────────────
+    BATCH_SIZE  = 64
+    LR          = 3e-4
+    EPOCHS      = 50
+    TEMPERATURE = 0.5
+    SSL_SPLIT   = 'splits/train_ssl_unlabeled.txt'
+
+    # ── 1. Load Data ────────────────────────────────────────────────────
+    print('Loading unlabeled SSL subset...')
+    two_view_tf = TwoViewTransform(simclr_transform)
+    ssl_dataset = load_split(SSL_SPLIT, transform=two_view_tf)
+    print(f'SSL pretraining samples: {len(ssl_dataset):,}\n')
+
+    ssl_loader = torch.utils.data.DataLoader(
+        ssl_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=2, drop_last=True
+    )
+
+    # ── 2. Initialize Model and Optimizer ──────────────────────────────
+    model = SimCLRModel().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+
+    # ── 3. Compute Untrained Similarities ───────────────────────────────
+    print('Computing average same/different image similarities (Before Training)...')
+    # Use a small subset dataloader to speed up similarity evaluation
+    sim_dataset = load_split('splits/val.txt', transform=two_view_tf)
+    sim_loader = torch.utils.data.DataLoader(sim_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    
+    pre_same, pre_diff = compute_avg_similarities(model, sim_loader, device)
+    print(f'Before Training:')
+    print(f'  Average Same-Image Similarity     : {pre_same:.4f}')
+    print(f'  Average Different-Image Similarity: {pre_diff:.4f}\n')
+
+    # Heatmap before training
+    visualize_4_samples(
+        model, ssl_dataset, device, 
+        'results/similarity_matrix_before_training.png',
+        "Cosine Similarity Matrix Before Training\n(Untrained ResNet-18 + MLP head)"
+    )
+    print('Before-training heatmap saved → results/similarity_matrix_before_training.png\n')
+
+    # ── 4. SimCLR Pretraining Loop ──────────────────────────────────────
+    print('Starting SimCLR Pretraining...')
+    loss_history = []
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+        
+        for (x_i, x_j), _ in ssl_loader:
+            # Stack positive pairs: shape is (2 * batch_size, 3, 32, 32)
+            x_batch = torch.cat([x_i, x_j], dim=0).to(device)
+            
+            optimizer.zero_grad()
+            z_batch = model(x_batch)
+            loss = nt_xent_loss(z_batch, temperature=TEMPERATURE)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+        epoch_loss = total_loss / len(ssl_loader)
+        loss_history.append(epoch_loss)
+        print(f'Epoch [{epoch:02d}/{EPOCHS}] - Loss: {epoch_loss:.4f}')
+
+    # Save Pretraining Loss Curve
+    plt.figure(figsize=(8, 5))
+    plt.plot(range(1, EPOCHS + 1), loss_history, label='Pretraining Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('NT-Xent Loss')
+    plt.title('SimCLR Unsupervised Pretraining Loss Curve')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('graphs/simclr_pretraining_loss.png', dpi=150)
+    plt.close()
+    print('\nPretraining loss curve saved → graphs/simclr_pretraining_loss.png')
+
+    # ── 5. Save Encoder Weight Checkpoint ───────────────────────────────
+    torch.save(model.encoder.state_dict(), 'models/simclr_encoder.pt')
+    print('Encoder weights saved → models/simclr_encoder.pt')
+
+    # ── 6. Compute Trained Similarities ─────────────────────────────────
+    print('\nComputing average same/different image similarities (After Training)...')
+    post_same, post_diff = compute_avg_similarities(model, sim_loader, device)
+    print(f'After Training:')
+    print(f'  Average Same-Image Similarity     : {post_same:.4f}')
+    print(f'  Average Different-Image Similarity: {post_diff:.4f}\n')
+
+    # Heatmap after training
+    visualize_4_samples(
+        model, ssl_dataset, device, 
+        'results/similarity_matrix_after_training.png',
+        "Cosine Similarity Matrix After Training\n(Pretrained ResNet-18 + MLP head)"
+    )
+    print('After-training heatmap saved → results/similarity_matrix_after_training.png')
+
 
