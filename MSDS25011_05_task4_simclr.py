@@ -4,12 +4,13 @@ Defines the SimCLR architecture — a CIFAR-10-adapted ResNet-18 encoder
 with a two-layer MLP projection head.
 """
 
+import json
 import os
 import random
 import numpy as np
 import torch
 import torch.nn as nn
-from torchvision import models
+from torchvision import datasets, models
 
 # ── Reproducibility ─────────────────────────────────────────────────────────
 SEED = 2026
@@ -154,6 +155,40 @@ def compute_avg_similarities(model: nn.Module, dataloader: torch.utils.data.Data
     return avg_same, avg_diff
 
 
+def save_similarity_metrics(
+    pre_same: float,
+    pre_diff: float,
+    post_same: float | None = None,
+    post_diff: float | None = None,
+    *,
+    batch_size: int = 64,
+    out_path: str = 'results/metrics.json',
+) -> None:
+    """Persist before/after similarity stats for the report and metrics.json."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    metrics: dict = {}
+    if os.path.exists(out_path):
+        with open(out_path, 'r') as f:
+            metrics = json.load(f)
+
+    metrics.update({
+        'seed': SEED,
+        'batch_size': batch_size,
+        'simclr_epochs': 50,
+        'learning_rate': 0.0003,
+        'temperature': 0.5,
+        'same_view_similarity_before': round(pre_same, 6),
+        'different_image_similarity_before': round(pre_diff, 6),
+    })
+    if post_same is not None and post_diff is not None:
+        metrics['same_view_similarity_after'] = round(post_same, 6)
+        metrics['different_image_similarity_after'] = round(post_diff, 6)
+
+    with open(out_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+
 def load_split(split_file: str, transform, cifar_root: str = './data') -> torch.utils.data.Subset:
     """
     Load a CIFAR-10 subset defined by an index file with a custom transform.
@@ -172,6 +207,10 @@ def load_split(split_file: str, transform, cifar_root: str = './data') -> torch.
 
 def save_similarity_heatmap(sim_matrix: np.ndarray, filename: str, title: str):
     """Saves an 8x8 similarity matrix heatmap."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
     labels = [
         'Img1_V1', 'Img2_V1', 'Img3_V1', 'Img4_V1',
         'Img1_V2', 'Img2_V2', 'Img3_V2', 'Img4_V2'
@@ -223,7 +262,6 @@ if __name__ == '__main__':
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from torchvision import datasets
     from MSDS25011_05_task2_augmentations import TwoViewTransform, simclr_transform
 
     # Output directories
@@ -233,13 +271,12 @@ if __name__ == '__main__':
     # ── Device selection ────────────────────────────────────────────────
     if torch.backends.mps.is_available():
         device = torch.device('mps')
-    elif torch.cuda.is_available():
-        device = torch.device('cuda')
     else:
         device = torch.device('cpu')
     print(f'Using device: {device}\n')
 
     # ── Hyperparameters ─────────────────────────────────────────────────
+    # Use 32 instead of 64 if MPS runs out of memory
     BATCH_SIZE  = 64
     LR          = 3e-4
     EPOCHS      = 50
@@ -271,6 +308,8 @@ if __name__ == '__main__':
     print(f'Before Training:')
     print(f'  Average Same-Image Similarity     : {pre_same:.4f}')
     print(f'  Average Different-Image Similarity: {pre_diff:.4f}\n')
+    save_similarity_metrics(pre_same, pre_diff, batch_size=BATCH_SIZE)
+    print('Before-training similarities saved → results/metrics.json\n')
 
     # Heatmap before training
     visualize_4_samples(
@@ -326,6 +365,8 @@ if __name__ == '__main__':
     print(f'After Training:')
     print(f'  Average Same-Image Similarity     : {post_same:.4f}')
     print(f'  Average Different-Image Similarity: {post_diff:.4f}\n')
+    save_similarity_metrics(pre_same, pre_diff, post_same, post_diff, batch_size=BATCH_SIZE)
+    print('After-training similarities saved → results/metrics.json\n')
 
     # Heatmap after training
     visualize_4_samples(
